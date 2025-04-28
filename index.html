@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>WebXR AR Runner Game</title>
+  <title>WebXR AR Runner Game with Hand Tracking</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -45,36 +45,52 @@
       backdrop-filter: blur(5px);
       box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     }
-    #score {
+    #scoreDisplay {
       position: absolute;
       top: 20px;
       right: 20px;
-      color: white;
       font-size: 24px;
-      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      background: rgba(0, 0, 0, 0.6);
       padding: 10px 15px;
       border-radius: 12px;
-      backdrop-filter: blur(5px);
+      display: none;
+      z-index: 2;
     }
   </style>
 </head>
 <body>
   <div id="overlay">
-    <button id="start-button">Start AR Experience</button>
+    <button id="start-button">Start AR Runner Game</button>
     <div id="status"></div>
   </div>
-  <div id="score">Score: 0</div>
+  <div id="scoreDisplay">Score: 0</div>
   
   <script type="module">
     import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
     import { ARButton } from 'https://unpkg.com/three@0.150.1/examples/jsm/webxr/ARButton.js';
 
-    let camera, scene, renderer, controller;
-    let playerMesh, currentLaneIndex = 1;
-    let score = 0, objects = [];
-    const lanes = [-0.5, 0, 0.5];
-    let canChangeLane = true;
-    const laneChangeThreshold = 0.3;
+    let camera, scene, renderer;
+    let controller;
+    let gameRunway;
+    let player;
+    let obstacles = [];
+    let collectibles = [];
+    let score = 0;
+    let isGameActive = false;
+    let lanes = [-0.4, 0, 0.4]; // Left, Center, Right
+    let currentLane = 1; // Start in the center lane
+    let clock = new THREE.Clock();
+    let gameSpeed = 2; // Base game speed
+    let gameArea;
+    
+    // Hand tracking variables
+    let handSpace = null;
+    let handModelRight = null;
+    let previousWristRoll = 0;
+    let wristRollThreshold = 0.3; // Threshold for detecting wrist rotation
+    let handJoints = {};
+    let movementCooldown = 0;
     
     init();
 
@@ -96,16 +112,9 @@
       scene.add(ambientLight);
 
       const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
-      directionalLight.position.set(1, 1, 1);
+      directionalLight.position.set(0, 1, 0);
       directionalLight.castShadow = true;
       scene.add(directionalLight);
-
-      // Player setup
-      const playerGeometry = new THREE.SphereGeometry(0.1);
-      const playerMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
-      playerMesh = new THREE.Mesh(playerGeometry, playerMaterial);
-      playerMesh.position.set(0, 0, 0);
-      scene.add(playerMesh);
 
       // Start button event
       document.getElementById('start-button').addEventListener('click', () => {
@@ -113,7 +122,7 @@
           navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
             if (supported) {
               const sessionInit = { 
-                requiredFeatures: ['hit-test'],
+                requiredFeatures: ['hit-test', 'hand-tracking'],
                 optionalFeatures: ['dom-overlay'], 
                 domOverlay: { root: document.body } 
               };
@@ -127,6 +136,7 @@
         }
       });
 
+      // Handle window resize
       window.addEventListener('resize', onWindowResize);
     }
 
@@ -136,6 +146,12 @@
       statusElement.textContent = message;
     }
 
+    function updateScore(points) {
+      score += points;
+      const scoreDisplay = document.getElementById('scoreDisplay');
+      scoreDisplay.textContent = `Score: ${score}`;
+    }
+
     function onWindowResize() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
@@ -143,115 +159,436 @@
     }
 
     function onSessionStarted(session) {
+      // Set up XR session
       renderer.xr.setReferenceSpaceType('local');
       renderer.xr.setSession(session);
+      
+      // Hide button and show status
       document.getElementById('start-button').style.display = 'none';
-      updateStatus('Game started! Move controller left/right to change lanes');
+      document.getElementById('scoreDisplay').style.display = 'block';
+      updateStatus('Looking for surface to place the game...');
 
-      setupController(session);
+      // Set up hand tracking
+      setupHandTracking(session);
+      
+      // Create the game area container
+      gameArea = new THREE.Group();
+      scene.add(gameArea);
+      
+      // Position the game area in front of the user
+      gameArea.position.set(0, -0.5, -2);
+      
+      // Create game elements
+      createRunway();
+      createPlayer();
+      
+      // Start animation loop
       renderer.setAnimationLoop(render);
+
+      // Handle session end
       session.addEventListener('end', onSessionEnd);
+      
+      // Start the game after a brief delay
+      setTimeout(() => {
+        startGame();
+      }, 2000);
     }
 
     function onSessionEnd() {
-      updateStatus('Game ended');
+      isGameActive = false;
+      updateStatus('AR session ended');
       document.getElementById('start-button').style.display = 'block';
-      score = 0;
-      objects.forEach(obj => scene.remove(obj));
-      objects = [];
-      document.getElementById('score').textContent = `Score: 0`;
+      document.getElementById('scoreDisplay').style.display = 'none';
     }
 
-    function setupController(session) {
-      controller = renderer.xr.getController(0);
-      controller.addEventListener('connected', (event) => {
-        updateStatus(`Controller connected: ${event.data.handedness}`);
+    function createRunway() {
+      // Create a runway for the game
+      const runwayGeometry = new THREE.BoxGeometry(1.5, 0.02, 6);
+      const runwayMaterial = new THREE.MeshStandardMaterial({
+        color: 0x444444,
+        metalness: 0.3,
+        roughness: 0.7,
       });
-      scene.add(controller);
-    }
-
-    function spawnObject() {
-      const type = Math.random() < 0.3 ? 'obstacle' : 'point';
-      const lane = lanes[Math.floor(Math.random() * 3)];
-      let object;
-
-      if (type === 'obstacle') {
-        object = new THREE.Mesh(
-          new THREE.BoxGeometry(0.2, 0.2, 0.2),
-          new THREE.MeshStandardMaterial({ color: 0xff0000 })
-        );
-        object.isObstacle = true;
-      } else {
-        object = new THREE.Mesh(
-          new THREE.SphereGeometry(0.1),
-          new THREE.MeshStandardMaterial({ color: 0xffff00 })
-        );
-        object.isObstacle = false;
-      }
-
-      object.position.set(lane, 0, 10);
-      scene.add(object);
-      objects.push(object);
-    }
-
-    function updatePlayerPosition() {
-      const targetX = lanes[currentLaneIndex];
-      playerMesh.position.x += (targetX - playerMesh.position.x) * 0.1;
-    }
-
-    function handleCollisions() {
-      const playerPos = playerMesh.position;
+      gameRunway = new THREE.Mesh(runwayGeometry, runwayMaterial);
+      gameRunway.receiveShadow = true;
+      gameArea.add(gameRunway);
       
-      for (let i = objects.length - 1; i >= 0; i--) {
-        const obj = objects[i];
-        obj.position.z -= 0.1;
+      // Add lane markers
+      const laneWidth = 0.3;
+      const laneMaterial = new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
+      
+      // Left lane marker
+      const leftLaneGeometry = new THREE.BoxGeometry(0.05, 0.025, 6);
+      const leftLane = new THREE.Mesh(leftLaneGeometry, laneMaterial);
+      leftLane.position.x = lanes[0] - laneWidth/2;
+      leftLane.position.y = 0.01;
+      gameArea.add(leftLane);
+      
+      // Right lane marker
+      const rightLaneGeometry = new THREE.BoxGeometry(0.05, 0.025, 6);
+      const rightLane = new THREE.Mesh(rightLaneGeometry, laneMaterial);
+      rightLane.position.x = lanes[2] + laneWidth/2;
+      rightLane.position.y = 0.01;
+      gameArea.add(rightLane);
+      
+      // Center lane marker (dashed)
+      for (let i = -2.9; i < 3; i += 0.4) {
+        const centerLanePiece = new THREE.Mesh(
+          new THREE.BoxGeometry(0.05, 0.025, 0.2),
+          laneMaterial
+        );
+        centerLanePiece.position.set(lanes[0] + laneWidth/2, 0.01, i);
+        gameArea.add(centerLanePiece);
+        
+        const centerLanePiece2 = new THREE.Mesh(
+          new THREE.BoxGeometry(0.05, 0.025, 0.2),
+          laneMaterial
+        );
+        centerLanePiece2.position.set(lanes[2] - laneWidth/2, 0.01, i);
+        gameArea.add(centerLanePiece2);
+      }
+    }
 
-        if (obj.position.z < -5) {
-          scene.remove(obj);
-          objects.splice(i, 1);
+    function createPlayer() {
+      // Create player character
+      const playerGeometry = new THREE.CapsuleGeometry(0.1, 0.2, 4, 8);
+      const playerMaterial = new THREE.MeshStandardMaterial({
+        color: 0x4876FF,
+        metalness: 0.7,
+        roughness: 0.3,
+      });
+      player = new THREE.Mesh(playerGeometry, playerMaterial);
+      player.position.set(lanes[currentLane], 0.15, -2); // Position at the bottom of runway
+      player.castShadow = true;
+      player.receiveShadow = true;
+      gameArea.add(player);
+    }
+
+    function setupHandTracking(session) {
+      // Request hand tracking reference space
+      handSpace = renderer.xr.getReferenceSpace();
+      
+      // Create a simple hand model to visualize the hand
+      handModelRight = new THREE.Group();
+      scene.add(handModelRight);
+      
+      // Setup joint objects for visualization (optional)
+      const jointMaterial = new THREE.MeshStandardMaterial({
+        color: 0x00FF00,
+        metalness: 0.1,
+        roughness: 0.1
+      });
+      
+      // Define the joints we want to track
+      const jointNames = [
+        'wrist',
+        'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+        'index-finger-metacarpal', 'index-finger-phalanx-proximal', 'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip',
+        'middle-finger-metacarpal', 'middle-finger-phalanx-proximal', 'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip',
+        'ring-finger-metacarpal', 'ring-finger-phalanx-proximal', 'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
+        'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal', 'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'
+      ];
+      
+      // Create joint visualization meshes
+      jointNames.forEach(jointName => {
+        const jointObject = new THREE.Mesh(
+          new THREE.SphereGeometry(0.008, 8, 8),
+          jointMaterial
+        );
+        jointObject.visible = false;
+        handJoints[jointName] = jointObject;
+        handModelRight.add(jointObject);
+      });
+      
+      // Create a special marker for the wrist to make it more visible
+      handJoints['wrist'].scale.set(1.5, 1.5, 1.5);
+      handJoints['wrist'].material = new THREE.MeshStandardMaterial({
+        color: 0xFF0000,
+        metalness: 0.3,
+        roughness: 0.4
+      });
+      
+      updateStatus('Hand tracking initialized. Rotate your wrist to control the player.');
+    }
+
+    function startGame() {
+      isGameActive = true;
+      score = 0;
+      updateScore(0);
+      updateStatus('Game started! Rotate your wrist to move between lanes.');
+      
+      // Reset game elements
+      obstacles.forEach(obstacle => gameArea.remove(obstacle));
+      collectibles.forEach(collectible => gameArea.remove(collectible));
+      
+      obstacles = [];
+      collectibles = [];
+      
+      clock.start();
+    }
+
+    function spawnObstacle() {
+      if (!isGameActive) return;
+      
+      // Choose a random lane
+      const randomLane = Math.floor(Math.random() * 3);
+      
+      // Create obstacle
+      const obstacleGeometry = new THREE.BoxGeometry(0.25, 0.25, 0.25);
+      const obstacleMaterial = new THREE.MeshStandardMaterial({
+        color: 0xFF0000,
+        roughness: 0.4,
+        metalness: 0.6
+      });
+      
+      const obstacle = new THREE.Mesh(obstacleGeometry, obstacleMaterial);
+      obstacle.position.set(lanes[randomLane], 0.15, 3); // Start at the far end of runway
+      obstacle.castShadow = true;
+      obstacle.receiveShadow = true;
+      
+      // Add to scene and track
+      gameArea.add(obstacle);
+      obstacles.push(obstacle);
+      
+      // Schedule next obstacle
+      const timeToNext = 1.5 + Math.random() * 1.5; // 1.5 to 3 seconds apart
+      setTimeout(spawnObstacle, timeToNext * 1000);
+    }
+
+    function spawnCollectible() {
+      if (!isGameActive) return;
+      
+      // Choose a random lane
+      const randomLane = Math.floor(Math.random() * 3);
+      
+      // Create coin
+      const coinGeometry = new THREE.CylinderGeometry(0.07, 0.07, 0.02, 16);
+      const coinMaterial = new THREE.MeshStandardMaterial({
+        color: 0xFFD700,
+        roughness: 0.2,
+        metalness: 0.9,
+        emissive: 0xFFD700,
+        emissiveIntensity: 0.3
+      });
+      
+      const coin = new THREE.Mesh(coinGeometry, coinMaterial);
+      coin.rotation.x = Math.PI / 2; // Lay flat
+      coin.position.set(lanes[randomLane], 0.15, 3); // Start at the far end
+      coin.castShadow = true;
+      
+      // Add to scene and track
+      gameArea.add(coin);
+      collectibles.push(coin);
+      
+      // Schedule next collectible
+      const timeToNext = 1 + Math.random() * 2; // 1 to 3 seconds apart
+      setTimeout(spawnCollectible, timeToNext * 1000);
+    }
+
+    function updateGameElements(deltaTime) {
+      const moveSpeed = gameSpeed * deltaTime;
+      
+      // Update obstacles
+      for (let i = obstacles.length - 1; i >= 0; i--) {
+        const obstacle = obstacles[i];
+        obstacle.position.z -= moveSpeed;
+        
+        // Remove if it's past the player
+        if (obstacle.position.z < -3) {
+          gameArea.remove(obstacle);
+          obstacles.splice(i, 1);
           continue;
         }
+        
+        // Rotate for visual effect
+        obstacle.rotation.x += 0.03;
+        obstacle.rotation.y += 0.03;
+        
+        // Check collision with player
+        if (Math.abs(obstacle.position.x - player.position.x) < 0.2 && 
+            Math.abs(obstacle.position.z - player.position.z) < 0.3) {
+          // Collision with obstacle
+          gameArea.remove(obstacle);
+          obstacles.splice(i, 1);
+          
+          // Visual feedback and lose points
+          player.material.emissive.setRGB(1, 0, 0);
+          player.material.emissiveIntensity = 1;
+          setTimeout(() => {
+            player.material.emissiveIntensity = 0;
+          }, 300);
+          
+          updateScore(-10);
+          updateStatus('Ouch! -10 points');
+        }
+      }
+      
+      // Update collectibles
+      for (let i = collectibles.length - 1; i >= 0; i--) {
+        const collectible = collectibles[i];
+        collectible.position.z -= moveSpeed;
+        
+        // Remove if it's past the player
+        if (collectible.position.z < -3) {
+          gameArea.remove(collectible);
+          collectibles.splice(i, 1);
+          continue;
+        }
+        
+        // Rotate for visual effect
+        collectible.rotation.z += 0.05;
+        
+        // Check collision with player
+        if (Math.abs(collectible.position.x - player.position.x) < 0.2 && 
+            Math.abs(collectible.position.z - player.position.z) < 0.3) {
+          // Collect the coin
+          gameArea.remove(collectible);
+          collectibles.splice(i, 1);
+          
+          // Visual feedback and add points
+          player.material.emissive.setRGB(0, 1, 0);
+          player.material.emissiveIntensity = 1;
+          setTimeout(() => {
+            player.material.emissiveIntensity = 0;
+          }, 300);
+          
+          updateScore(5);
+          updateStatus('Coin collected! +5 points');
+        }
+      }
+      
+      // Speed up game slightly over time
+      gameSpeed += deltaTime * 0.01;
+      
+      // Reduce movement cooldown
+      if (movementCooldown > 0) {
+        movementCooldown -= deltaTime;
+      }
+    }
 
-        const distance = playerPos.distanceTo(obj.position);
-        if (distance < 0.2) {
-          score += obj.isObstacle ? -10 : 10;
-          document.getElementById('score').textContent = `Score: ${score}`;
-          scene.remove(obj);
-          objects.splice(i, 1);
+    function processHandInput(frame) {
+      if (!frame || !isGameActive || movementCooldown > 0) return;
+      
+      // Get hand input sources
+      const inputSources = frame.session.inputSources;
+      
+      for (let i = 0; i < inputSources.length; i++) {
+        const inputSource = inputSources[i];
+        
+        // Check if this input source is a hand
+        if (inputSource.hand) {
+          const hand = inputSource.hand;
+          
+          // We're specifically looking for the right hand
+          if (inputSource.handedness === 'right') {
+            // Get the wrist joint pose
+            const wristJoint = hand.get('wrist');
+            
+            if (wristJoint) {
+              // Get the wrist pose in the reference space
+              const wristPose = frame.getPose(wristJoint.spaces.gripSpace, handSpace);
+              
+              if (wristPose) {
+                // Update the visualization of the hand joints
+                updateHandModel(hand, frame);
+                
+                // Get the wrist orientation from the pose
+                const orientation = wristPose.transform.orientation;
+                const quaternion = new THREE.Quaternion(
+                  orientation.x,
+                  orientation.y,
+                  orientation.z,
+                  orientation.w
+                );
+                
+                // Convert the quaternion to Euler angles to get the roll
+                const euler = new THREE.Euler().setFromQuaternion(quaternion, 'XYZ');
+                
+                // The roll is the rotation around the Z axis (in radians)
+                const wristRoll = euler.z;
+                
+                // Calculate the change in roll from the previous frame
+                const rollChange = wristRoll - previousWristRoll;
+                
+                // Check if the roll change exceeds our threshold for a lane change
+                if (Math.abs(rollChange) > wristRollThreshold) {
+                  // Clockwise rotation (positive roll change) moves right
+                  if (rollChange > 0 && currentLane < 2) {
+                    currentLane++;
+                    movementCooldown = 0.5; // Half second cooldown
+                    updateStatus(`Moving right to lane ${currentLane + 1}`);
+                  }
+                  // Counter-clockwise rotation (negative roll change) moves left
+                  else if (rollChange < 0 && currentLane > 0) {
+                    currentLane--;
+                    movementCooldown = 0.5; // Half second cooldown
+                    updateStatus(`Moving left to lane ${currentLane + 1}`);
+                  }
+                }
+                
+                // Store the current roll for the next frame
+                previousWristRoll = wristRoll;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    function updateHandModel(hand, frame) {
+      // Make the hand model visible when tracked
+      handModelRight.visible = true;
+      
+      // Update position of each joint
+      for (const jointName in handJoints) {
+        const joint = hand.get(jointName);
+        
+        if (joint) {
+          const jointPose = frame.getPose(joint.spaces.gripSpace, handSpace);
+          
+          if (jointPose) {
+            const position = jointPose.transform.position;
+            const jointObject = handJoints[jointName];
+            
+            // Update joint position
+            jointObject.position.set(position.x, position.y, position.z);
+            jointObject.visible = true;
+            
+            // Update joint orientation
+            const orientation = jointPose.transform.orientation;
+            jointObject.quaternion.set(orientation.x, orientation.y, orientation.z, orientation.w);
+          } else {
+            handJoints[jointName].visible = false;
+          }
+        } else {
+          handJoints[jointName].visible = false;
         }
       }
     }
 
     function render(timestamp, frame) {
-      if (!frame) return;
-
-      // Handle lane changes
-      if (controller) {
-        const controllerPos = new THREE.Vector3();
-        const cameraPos = new THREE.Vector3();
-        controller.getWorldPosition(controllerPos);
-        camera.getWorldPosition(cameraPos);
-        
-        const deltaX = controllerPos.x - cameraPos.x;
-        const absDeltaX = Math.abs(deltaX);
-
-        if (absDeltaX > laneChangeThreshold && canChangeLane) {
-          if (deltaX < 0 && currentLaneIndex > 0) {
-            currentLaneIndex--;
-          } else if (deltaX > 0 && currentLaneIndex < 2) {
-            currentLaneIndex++;
-          }
-          canChangeLane = false;
-        } else if (absDeltaX < laneChangeThreshold / 2) {
-          canChangeLane = true;
+      const deltaTime = clock.getDelta();
+      
+      if (isGameActive) {
+        // Process hand input for lane changes
+        if (frame) {
+          processHandInput(frame);
         }
+        
+        // Update player position (smooth lane transition)
+        const targetX = lanes[currentLane];
+        player.position.x += (targetX - player.position.x) * 0.1;
+        
+        // Update game elements
+        updateGameElements(deltaTime);
       }
 
-      // Spawn objects periodically
-      if (Math.random() < 0.02) spawnObject();
-
-      updatePlayerPosition();
-      handleCollisions();
+      // Start spawning obstacles and collectibles when game starts
+      if (isGameActive && obstacles.length === 0 && collectibles.length === 0) {
+        spawnObstacle();
+        spawnCollectible();
+      }
+      
       renderer.render(scene, camera);
     }
   </script>
